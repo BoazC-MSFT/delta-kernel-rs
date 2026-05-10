@@ -2143,6 +2143,178 @@ async fn for_timestamp_conversion_with_large_limit() {
     assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
 }
 
+// Verify that read_actions populates add.stats from stats_parsed for a real
+// struct-stats-only checkpoint table. This tests the data path that downstream
+// consumers like LogicalFileView/cached_log_data() use.
+#[test]
+fn test_read_actions_populates_stats_for_struct_stats_checkpoint() {
+    use crate::actions::get_log_add_schema;
+    use crate::arrow::array::Array;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::storage::store_from_url;
+    use crate::engine::default::DefaultEngine;
+
+    let table_path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/delta-1.2.1-only-struct-stats")).unwrap();
+
+    let url = url::Url::from_directory_path(&table_path).unwrap();
+    let store = store_from_url(&url).unwrap();
+    let engine = DefaultEngine::new(store);
+
+    let snapshot = crate::Snapshot::builder_for(url).build(&engine).unwrap();
+    let log_segment = snapshot.log_segment();
+
+    let schema = get_log_add_schema().clone();
+    let actions_iter = log_segment.read_actions(&engine, schema, None).unwrap();
+
+    let mut total_adds = 0;
+    let mut adds_with_stats = 0;
+    for batch_result in actions_iter {
+        let actions_batch = batch_result.unwrap();
+        let arrow_batch = ArrowEngineData::try_from_engine_data(actions_batch.actions).unwrap();
+        let record_batch = arrow_batch.record_batch();
+
+        let add_col = record_batch.column_by_name("add");
+        if add_col.is_none() {
+            continue;
+        }
+        let add_array = add_col
+            .unwrap()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::StructArray>()
+            .unwrap();
+
+        let stats_array = add_array
+            .column_by_name("stats")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::StringArray>()
+            .unwrap();
+
+        let path_array = add_array
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::StringArray>()
+            .unwrap();
+
+        for i in 0..record_batch.num_rows() {
+            if !add_array.is_null(i) && !path_array.is_null(i) {
+                total_adds += 1;
+                if !stats_array.is_null(i) {
+                    let json = stats_array.value(i);
+                    if json != "{}" && json.contains("numRecords") {
+                        adds_with_stats += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(total_adds, 12, "expected 12 add actions total");
+    assert_eq!(
+        adds_with_stats, 12,
+        "all 12 files should have stats with numRecords \
+        (including checkpoint entries with struct-only stats)"
+    );
+}
+
+/// Test that coalesce_stats_from_stats_parsed handles LargeUtf8 stats columns without panicking.
+/// Parquet readers may produce LargeUtf8 for string columns, especially on the
+/// parse-json-large-string branch.
+#[test]
+fn test_coalesce_handles_large_utf8_stats() {
+    use crate::arrow::array::{
+        Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    // Row 0: add.stats is non-null LargeUtf8 (existing JSON stats) -> should keep it
+    // Row 1: add.stats is null, stats_parsed has numRecords=42 -> should coalesce
+    // Row 2: add is null entirely -> should remain null
+    let stats_parsed_inner = StructArray::from(vec![(
+        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+        Arc::new(Int64Array::from(vec![Some(10), Some(42), None])) as Arc<dyn Array>,
+    )]);
+
+    let stats_col: LargeStringArray = vec![Some(r#"{"numRecords":10}"#), None, None].into();
+
+    let path_col: StringArray = vec![Some("file1.parquet"), Some("file2.parquet"), None].into();
+    let size_col = Int64Array::from(vec![Some(100), Some(200), None]);
+
+    let add_fields = vec![
+        Arc::new(Field::new("path", ArrowDataType::Utf8, true)),
+        Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+        Arc::new(Field::new("stats", ArrowDataType::LargeUtf8, true)),
+        Arc::new(Field::new(
+            "stats_parsed",
+            ArrowDataType::Struct(
+                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+            ),
+            true,
+        )),
+    ];
+    let add_array = StructArray::from(vec![
+        (add_fields[0].clone(), Arc::new(path_col) as Arc<dyn Array>),
+        (add_fields[1].clone(), Arc::new(size_col) as Arc<dyn Array>),
+        (add_fields[2].clone(), Arc::new(stats_col) as Arc<dyn Array>),
+        (
+            add_fields[3].clone(),
+            Arc::new(stats_parsed_inner) as Arc<dyn Array>,
+        ),
+    ]);
+
+    let batch_schema = Arc::new(Schema::new(vec![Field::new(
+        "add",
+        ArrowDataType::Struct(add_fields.iter().map(|f| f.as_ref().clone()).collect()),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(add_array)]).unwrap();
+
+    let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+    let result = super::coalesce_stats_from_stats_parsed(engine_data).unwrap();
+
+    // Verify the result
+    let result_arrow = ArrowEngineData::try_from_engine_data(result).unwrap();
+    let result_batch: RecordBatch = result_arrow.into();
+    let result_add = result_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+
+    // stats_parsed should be dropped
+    assert!(
+        result_add.column_by_name("stats_parsed").is_none(),
+        "stats_parsed should be dropped from output"
+    );
+
+    // stats should be present and populated
+    let result_stats = result_add
+        .column_by_name("stats")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Row 0: kept existing stats
+    assert!(!result_stats.is_null(0));
+    assert!(result_stats.value(0).contains("numRecords"));
+
+    // Row 1: coalesced from stats_parsed
+    assert!(!result_stats.is_null(1));
+    assert!(
+        result_stats.value(1).contains("42"),
+        "expected numRecords=42 from stats_parsed, got: {}",
+        result_stats.value(1)
+    );
+
+    // Row 2: both stats and stats_parsed.numRecords are null, but the struct row exists,
+    // so to_json produces a non-null JSON like {"numRecords":null}
+    assert!(!result_stats.is_null(2));
+}
+
 #[tokio::test]
 async fn for_timestamp_conversion_no_commit_files() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(

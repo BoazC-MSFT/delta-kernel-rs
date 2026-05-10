@@ -67,6 +67,261 @@ pub(crate) struct LogSegment {
     pub latest_commit_file: Option<ParsedLogPath>,
 }
 
+/// Augments a checkpoint read schema by adding `add.stats_parsed.numRecords` to the `add` struct.
+/// Only `numRecords` is requested — this is intentionally scoped: `minValues`, `maxValues`, and
+/// `nullCount` are schema-dependent and already consumed directly as structs by the data-skipping
+/// path. This augmentation serves callers that read `add.stats` as a JSON string (e.g.
+/// `LogicalFileView::num_records()`).
+///
+/// Returns `None` if the schema has no `add` field, it's not a struct, or `stats_parsed` is
+/// already present.
+fn augment_schema_with_num_records(schema: &crate::schema::StructType) -> Option<SchemaRef> {
+    use crate::schema::{DataType, StructType};
+
+    let add_field = schema.field("add")?;
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        return None;
+    };
+    if add_struct.field("stats_parsed").is_some() {
+        return None;
+    }
+    let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+    add_fields.push(StructField::nullable(
+        "stats_parsed",
+        StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]),
+    ));
+    let new_add = StructField::new(
+        add_field.name(),
+        StructType::new_unchecked(add_fields),
+        add_field.is_nullable(),
+    );
+    let fields: Vec<StructField> = schema
+        .fields()
+        .map(|f| {
+            if f.name() == "add" {
+                new_add.clone()
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Some(Arc::new(StructType::new_unchecked(fields)))
+}
+
+/// Coalesces two string-typed arrays: for each row, takes `existing` if non-null, otherwise
+/// `fallback`. Accepts any Arrow string array type for `existing` (Utf8, LargeUtf8, Utf8View).
+#[cfg(feature = "need-arrow")]
+fn coalesce_string_arrays<S>(
+    existing: &S,
+    fallback: &crate::arrow::array::StringArray,
+    num_rows: usize,
+) -> crate::arrow::array::StringArray
+where
+    S: crate::arrow::array::Array + 'static,
+    for<'a> &'a S: IntoIterator<Item = Option<&'a str>>,
+{
+    existing
+        .into_iter()
+        .zip(fallback.iter())
+        .take(num_rows)
+        .map(|(e, f)| e.or(f).map(|s| s.to_string()))
+        .collect()
+}
+
+/// For checkpoint batches with `add.stats_parsed`, populate `add.stats` (JSON string) from
+/// `stats_parsed` where `stats` is null. This ensures downstream consumers that read `add.stats`
+/// (like `LogicalFileView`) see populated stats for struct-stats-only checkpoints.
+///
+/// Operates directly on Arrow arrays. Returns the original batch if no modifications are needed,
+/// or a new batch with the `stats` column populated and `stats_parsed` dropped from `add`.
+///
+/// NOTE: `stats_parsed` is unconditionally removed from the output. This is safe because
+/// `stats_parsed` is only present when `augment_schema_with_num_records` added it internally
+/// — no caller in v0.19.2 requests `stats_parsed` in their read schema. If a future caller
+/// explicitly requests `stats_parsed`, this function should be updated to preserve it.
+#[cfg(feature = "need-arrow")]
+fn coalesce_stats_from_stats_parsed(
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    use crate::arrow::array::{Array, AsArray, RecordBatch, StringArray, StructArray};
+    use crate::arrow::datatypes::DataType as ArrowDataType;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_expression::evaluate_expression::to_json;
+
+    let arrow_data = ArrowEngineData::try_from_engine_data(batch)?;
+    let record_batch: RecordBatch = arrow_data.into();
+
+    let Some(add_idx) = record_batch.schema().index_of("add").ok() else {
+        return Ok(Box::new(ArrowEngineData::new(record_batch)));
+    };
+    let add_col = record_batch.column(add_idx);
+    let add_array = add_col.as_struct();
+
+    let Some(sp_col_idx) = add_array
+        .fields()
+        .iter()
+        .position(|f: &Arc<crate::arrow::datatypes::Field>| f.name() == "stats_parsed")
+    else {
+        return Ok(Box::new(ArrowEngineData::new(record_batch)));
+    };
+    let stats_parsed_col = add_array.column(sp_col_idx);
+
+    // Fast path: if stats_parsed is entirely null (common case — checkpoints that already
+    // have JSON stats), skip the expensive to_json + coalesce and just drop the column.
+    if stats_parsed_col.null_count() == stats_parsed_col.len() {
+        return drop_stats_parsed_column(&record_batch, add_idx, add_array, sp_col_idx);
+    }
+
+    // Find the stats column
+    let Some(stats_col_idx) = add_array
+        .fields()
+        .iter()
+        .position(|f: &Arc<crate::arrow::datatypes::Field>| f.name() == "stats")
+    else {
+        return Ok(Box::new(ArrowEngineData::new(record_batch)));
+    };
+
+    // Serialize stats_parsed to JSON (to_json always returns Utf8/StringArray)
+    let stats_parsed_struct = stats_parsed_col.as_struct();
+    let stats_json_from_parsed = to_json(stats_parsed_struct).map_err(|e| Error::Arrow(e))?;
+    let stats_json_array = stats_json_from_parsed.as_string::<i32>();
+
+    // COALESCE: prefer existing stats, fall back to serialized stats_parsed.
+    // The existing stats column may be Utf8, LargeUtf8, or Utf8View depending on
+    // the parquet reader — handle all three to avoid panics.
+    let existing_stats = add_array.column(stats_col_idx);
+    let num_rows = record_batch.num_rows();
+    let coalesced: StringArray = match existing_stats.data_type() {
+        ArrowDataType::Utf8 => coalesce_string_arrays(
+            existing_stats.as_string::<i32>(),
+            stats_json_array,
+            num_rows,
+        ),
+        ArrowDataType::LargeUtf8 => coalesce_string_arrays(
+            existing_stats.as_string::<i64>(),
+            stats_json_array,
+            num_rows,
+        ),
+        ArrowDataType::Utf8View => coalesce_string_arrays(
+            existing_stats
+                .as_any()
+                .downcast_ref::<crate::arrow::array::StringViewArray>()
+                .unwrap(),
+            stats_json_array,
+            num_rows,
+        ),
+        // Unexpected type — leave stats as-is, just drop stats_parsed
+        _ => {
+            return drop_stats_parsed_column(&record_batch, add_idx, add_array, sp_col_idx);
+        }
+    };
+
+    // Rebuild the add struct: replace stats column, drop stats_parsed
+    let mut new_add_columns: Vec<Arc<dyn Array>> = Vec::new();
+    let mut new_add_fields = Vec::new();
+    let add_fields = add_array.fields();
+    for (i, field) in add_fields.iter().enumerate() {
+        let field_name = field.name().as_str();
+        if field_name == "stats" {
+            new_add_columns.push(Arc::new(coalesced.clone()));
+            new_add_fields.push(Arc::new(crate::arrow::datatypes::Field::new(
+                "stats",
+                ArrowDataType::Utf8,
+                true,
+            )));
+        } else if field_name == "stats_parsed" {
+            // Drop stats_parsed from the output
+            continue;
+        } else {
+            new_add_columns.push(add_array.column(i).clone());
+            new_add_fields.push(field.clone());
+        }
+    }
+
+    let new_add = StructArray::new(
+        new_add_fields.into(),
+        new_add_columns,
+        add_array.nulls().cloned(),
+    );
+
+    // Rebuild the record batch with the modified add column
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+    let mut fields = Vec::new();
+    let batch_schema = record_batch.schema();
+    for (i, field) in batch_schema.fields().iter().enumerate() {
+        let field_name = field.name().as_str();
+        if field_name == "add" {
+            columns.push(Arc::new(new_add.clone()));
+            fields.push(Arc::new(crate::arrow::datatypes::Field::new(
+                "add",
+                new_add.data_type().clone(),
+                true,
+            )));
+        } else {
+            columns.push(record_batch.column(i).clone());
+            fields.push(field.clone());
+        }
+    }
+
+    let new_schema = Arc::new(crate::arrow::datatypes::Schema::new(fields));
+    let new_batch = RecordBatch::try_new(new_schema, columns).map_err(|e| Error::Arrow(e))?;
+    Ok(Box::new(ArrowEngineData::new(new_batch)))
+}
+
+/// Rebuilds the batch with `stats_parsed` removed from the `add` struct, leaving all other
+/// columns untouched. Used as a fast path when `stats_parsed` is all-null.
+#[cfg(feature = "need-arrow")]
+fn drop_stats_parsed_column(
+    record_batch: &crate::arrow::array::RecordBatch,
+    add_idx: usize,
+    add_array: &crate::arrow::array::StructArray,
+    sp_col_idx: usize,
+) -> DeltaResult<Box<dyn EngineData>> {
+    use crate::arrow::array::{Array, RecordBatch, StructArray};
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    let mut new_add_columns = Vec::with_capacity(add_array.num_columns() - 1);
+    let mut new_add_fields = Vec::with_capacity(add_array.num_columns() - 1);
+    for (i, field) in add_array.fields().iter().enumerate() {
+        if i == sp_col_idx {
+            continue;
+        }
+        new_add_columns.push(add_array.column(i).clone());
+        new_add_fields.push(field.clone());
+    }
+    let new_add = StructArray::new(
+        new_add_fields.into(),
+        new_add_columns,
+        add_array.nulls().cloned(),
+    );
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(record_batch.num_columns());
+    let mut fields = Vec::with_capacity(record_batch.num_columns());
+    for (i, field) in record_batch.schema().fields().iter().enumerate() {
+        if i == add_idx {
+            columns.push(Arc::new(new_add.clone()));
+            fields.push(Arc::new(crate::arrow::datatypes::Field::new(
+                "add",
+                new_add.data_type().clone(),
+                true,
+            )));
+        } else {
+            columns.push(record_batch.column(i).clone());
+            fields.push(field.clone());
+        }
+    }
+    let new_schema = Arc::new(crate::arrow::datatypes::Schema::new(fields));
+    let new_batch = RecordBatch::try_new(new_schema, columns).map_err(|e| Error::Arrow(e))?;
+    Ok(Box::new(ArrowEngineData::new(new_batch)))
+}
+
+#[cfg(not(feature = "need-arrow"))]
+fn coalesce_stats_from_stats_parsed(
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    Ok(batch)
+}
+
 impl LogSegment {
     #[internal_api]
     pub(crate) fn try_new(
@@ -409,6 +664,13 @@ impl LogSegment {
     /// sidecar files contain the actual file actions that would otherwise be
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
+    ///
+    /// When the schema contains an `add` field, the read schema is augmented with
+    /// `add.stats_parsed.numRecords` so that struct-stats-only checkpoints can have
+    /// `numRecords` surfaced through `add.stats`. After reading, `add.stats` is populated
+    /// from `stats_parsed` where `stats` is null, and `stats_parsed` is dropped from the
+    /// output. Only `numRecords` is surfaced this way — `minValues`/`maxValues`/`nullCount`
+    /// are schema-dependent and already consumed directly by the data-skipping path.
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -438,6 +700,12 @@ impl LogSegment {
             .collect();
 
         let parquet_handler = engine.parquet_handler();
+
+        // Augment the read schema with add.stats_parsed.numRecords so struct-stats-only
+        // checkpoints can surface numRecords through add.stats. If the column is missing from
+        // the parquet file, the reader fills it with nulls and the coalesce is a no-op.
+        let checkpoint_read_schema = augment_schema_with_num_records(&checkpoint_read_schema)
+            .unwrap_or_else(|| checkpoint_read_schema.clone());
 
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
         // but it was removed to avoid unnecessary coupling. This is a concrete case
@@ -473,6 +741,11 @@ impl LogSegment {
         let actions_iter = actions
             .map(move |checkpoint_batch_result| -> DeltaResult<_> {
                 let checkpoint_batch = checkpoint_batch_result?;
+
+                // Populate add.stats from add.stats_parsed for struct-stats-only checkpoints.
+                // When stats_parsed is all-null (normal checkpoints), this is a no-op.
+                let checkpoint_batch = coalesce_stats_from_stats_parsed(checkpoint_batch)?;
+
                 // This closure maps the checkpoint batch to an iterator of batches
                 // by chaining the checkpoint batch with sidecar batches if they exist.
 
