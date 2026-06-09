@@ -20,6 +20,7 @@ delta_kernel = { path = "../kernel", version = "0.24.0", features = [
 ] }
 bytes = "1.10"
 futures = "0.3"
+lru = "0.12"
 itertools = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "system-proxy"] }
 tokio = { version = "1.47", features = ["rt-multi-thread"] }

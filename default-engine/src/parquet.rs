@@ -1,9 +1,11 @@
 //! Default Parquet handler implementation
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use bytes::Bytes;
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
@@ -40,6 +42,21 @@ use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
 use crate::UrlExt;
+
+/// Max file size eligible for in-memory caching (10 MB).
+const PARQUET_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Max entries in the parquet file cache.
+const PARQUET_CACHE_MAX_ENTRIES: NonZeroUsize = match NonZeroUsize::new(32) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
+/// Process-wide parquet file bytes cache shared across engine instances.
+fn parquet_file_cache() -> &'static Mutex<lru::LruCache<String, Bytes>> {
+    static CACHE: OnceLock<Mutex<lru::LruCache<String, Bytes>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(PARQUET_CACHE_MAX_ENTRIES)))
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -414,6 +431,69 @@ async fn open_parquet_file(
     let file_location = file_meta.location.to_string();
     let path = Path::from_url_path(file_meta.location.path())?;
 
+    // Small files: fetch fully into memory (with caching), use sync reader.
+    // This avoids HEAD + multiple range GETs for repeated reads of the same file
+    // (e.g. checkpoint read for P&M then for file actions).
+    if file_meta.size > 0 && file_meta.size <= PARQUET_CACHE_MAX_BYTES {
+        let path_key = path.to_string();
+
+        let cached = parquet_file_cache()
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&path_key).cloned());
+        let bytes = match cached {
+            Some(b) => b,
+            None => {
+                let b = store.get(&path).await?.bytes().await?;
+                if let Ok(mut cache) = parquet_file_cache().lock() {
+                    cache.put(path_key, b.clone());
+                }
+                b
+            }
+        };
+
+        let reader_options = reader_options();
+        let metadata = ArrowReaderMetadata::load(&bytes, reader_options.clone())?;
+        let parquet_schema = metadata.schema();
+        let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_options)?;
+        if let Some(mask) = generate_mask(
+            &table_schema,
+            parquet_schema,
+            builder.parquet_schema(),
+            &indices,
+        ) {
+            builder = builder.with_projection(mask)
+        }
+
+        let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
+            .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+
+        if let Some(ref predicate) = predicate {
+            builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+        }
+        if let Some(limit) = limit {
+            builder = builder.with_limit(limit)
+        }
+
+        let reader = builder.with_batch_size(batch_size).build()?;
+        let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+        let stream = futures::stream::iter(reader);
+        let stream = stream.map(move |rbr| {
+            fixup_parquet_read(
+                rbr?,
+                &requested_ordering,
+                row_indexes.as_mut(),
+                Some(&file_location),
+                Some(&table_schema),
+            )
+            .map(Into::into)
+        });
+        return Ok(stream.boxed());
+    }
+
+    // Large files: use the original async streaming reader (no caching).
     let mut reader = {
         use delta_kernel::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range

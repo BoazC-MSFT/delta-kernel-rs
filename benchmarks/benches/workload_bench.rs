@@ -37,6 +37,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                             operation,
                             config,
                             runtime.clone(),
+                            None,
                         )
                         .expect("Failed to create read runner");
                         run_benchmark(c, runner.as_ref(), &reporter);

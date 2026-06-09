@@ -1,11 +1,13 @@
 //! Default Json handler implementation
 
-use std::io::BufReader;
-use std::sync::Arc;
+use std::io::{BufReader, Cursor, Read};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 
 use bytes::{Buf, Bytes};
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_utils::{
@@ -27,6 +29,22 @@ use futures::{ready, StreamExt, TryStreamExt};
 use url::Url;
 
 use crate::executor::TaskExecutor;
+
+/// Max file size eligible for JSON caching. Commit JSON files are typically ~1 KB.
+const JSON_CACHE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Max entries in the JSON file cache. Commit files are tiny (~1 KB each), so
+/// 2048 entries costs at most a few MB of memory.
+const JSON_CACHE_MAX_ENTRIES: NonZeroUsize = match NonZeroUsize::new(2048) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
+/// Process-wide JSON file bytes cache shared across engine instances.
+fn json_file_cache() -> &'static Mutex<lru::LruCache<String, Bytes>> {
+    static CACHE: OnceLock<Mutex<lru::LruCache<String, Bytes>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(JSON_CACHE_MAX_ENTRIES)))
+}
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -198,64 +216,118 @@ async fn open_json_file(
     batch_size: usize,
     file_meta: FileMeta,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+    // Wraps an Arrow JSON reader as a boxed stream, stopping after the first error.
+    // Emit exactly one error, then stop the stream. We check seen_error BEFORE
+    // updating it so the first error passes through, but subsequent items don't.
+    // This is necessary because Arrow's Reader loops the same error indefinitely.
+    fn json_reader_to_stream(
+        reader: impl Iterator<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
+    ) -> BoxStream<'static, DeltaResult<RecordBatch>> {
+        let reader = futures::stream::iter(reader).map_err(Error::from);
+        let mut seen_error = false;
+        reader
+            .take_while(move |result| {
+                let return_this = !seen_error;
+                if result.is_err() {
+                    seen_error = true;
+                }
+                futures::future::ready(return_this)
+            })
+            .boxed()
+    }
+
     let path = Path::from_url_path(file_meta.location.path())?;
+    let cache_key = file_meta.location.to_string();
+
+    // Check the cache first.
+    let cached = json_file_cache()
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get(&cache_key).cloned());
+
+    if let Some(bytes) = cached {
+        let reader = ReaderBuilder::new(schema)
+            .with_batch_size(batch_size)
+            .with_coerce_primitive(true)
+            .build(Cursor::new(bytes))?;
+        return Ok(json_reader_to_stream(reader));
+    }
+
     let result = store.get(&path).await?;
     let builder = ReaderBuilder::new(schema)
         .with_batch_size(batch_size)
         .with_coerce_primitive(true);
     match result.payload {
         GetResultPayload::File(file, _) => {
-            let reader = builder.build(BufReader::new(file))?;
-            let reader = futures::stream::iter(reader).map_err(Error::from);
-
-            // Emit exactly one error, then stop the stream. We check seen_error BEFORE
-            // updating it so the first error passes through, but subsequent items don't.
-            // This is necessary because Arrow's Reader loops the same error indefinitely.
-            let mut seen_error = false;
-            let reader = reader.take_while(move |result| {
-                let return_this = !seen_error;
-                if result.is_err() {
-                    seen_error = true;
+            if file_meta.size > 0 && file_meta.size < JSON_CACHE_MAX_BYTES {
+                let mut buf = Vec::with_capacity(file_meta.size as usize);
+                Read::read_to_end(&mut BufReader::new(file), &mut buf)?;
+                let bytes = Bytes::from(buf);
+                if let Ok(mut cache) = json_file_cache().lock() {
+                    cache.put(cache_key, bytes.clone());
                 }
-                futures::future::ready(return_this)
-            });
-            Ok(reader.boxed())
+                let reader = builder.build(Cursor::new(bytes))?;
+                Ok(json_reader_to_stream(reader))
+            } else {
+                let reader = builder.build(BufReader::new(file))?;
+                Ok(json_reader_to_stream(reader))
+            }
         }
         GetResultPayload::Stream(s) => {
-            let mut decoder = builder.build_decoder()?;
-            let mut input = s.map_err(Error::from);
-            let mut buffered = Bytes::new();
-            let s = futures::stream::poll_fn(move |cx| {
-                loop {
-                    if buffered.is_empty() {
-                        buffered = match ready!(input.poll_next_unpin(cx)) {
-                            Some(Ok(b)) => b,
-                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                            None => break,
-                        };
-                    }
+            // Small files: collect bytes, cache, and parse from memory.
+            if file_meta.size > 0 && file_meta.size < JSON_CACHE_MAX_BYTES {
+                let all_bytes: Bytes = s
+                    .map_err(Error::from)
+                    .try_fold(Vec::new(), |mut acc, chunk| async move {
+                        acc.extend_from_slice(&chunk);
+                        Ok(acc)
+                    })
+                    .await
+                    .map(Bytes::from)?;
 
-                    // NB (from Decoder::decode docs):
-                    // Read JSON objects from `buf` (param), returning the number of bytes read
-                    //
-                    // This method returns once `batch_size` objects have been parsed since the
-                    // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
-                    // should be included in the next call to [`Self::decode`]
-                    let decoded = match decoder.decode(buffered.as_ref()) {
-                        Ok(decoded) => decoded,
-                        Err(e) => return Poll::Ready(Some(Err(e.into()))),
-                    };
-
-                    let read = buffered.len();
-                    buffered.advance(decoded);
-                    if decoded != read {
-                        break;
-                    }
+                if let Ok(mut cache) = json_file_cache().lock() {
+                    cache.put(cache_key, all_bytes.clone());
                 }
 
-                Poll::Ready(decoder.flush().map_err(Error::from).transpose())
-            });
-            Ok(s.boxed())
+                let reader = builder.build(Cursor::new(all_bytes))?;
+                Ok(json_reader_to_stream(reader))
+            } else {
+                // Large files: stream and decode incrementally.
+                let mut decoder = builder.build_decoder()?;
+                let mut input = s.map_err(Error::from);
+                let mut buffered = Bytes::new();
+                let s = futures::stream::poll_fn(move |cx| {
+                    loop {
+                        if buffered.is_empty() {
+                            buffered = match ready!(input.poll_next_unpin(cx)) {
+                                Some(Ok(b)) => b,
+                                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                                None => break,
+                            };
+                        }
+
+                        // NB (from Decoder::decode docs):
+                        // Read JSON objects from `buf` (param), returning the number of bytes read
+                        //
+                        // This method returns once `batch_size` objects have been parsed since the
+                        // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
+                        // should be included in the next call to [`Self::decode`]
+                        let decoded = match decoder.decode(buffered.as_ref()) {
+                            Ok(decoded) => decoded,
+                            Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                        };
+
+                        let read = buffered.len();
+                        buffered.advance(decoded);
+                        if decoded != read {
+                            break;
+                        }
+                    }
+
+                    Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                });
+                Ok(s.boxed())
+            }
         }
     }
 }

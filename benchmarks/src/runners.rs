@@ -52,6 +52,14 @@ fn build_engine(
     )
 }
 
+/// Optional transform applied to the `ObjectStore` before building the engine.
+/// Used by `latency_bench` to inject simulated storage latency.
+pub type StoreWrapper = Option<
+    fn(
+        Arc<delta_kernel::object_store::DynObjectStore>,
+    ) -> Arc<delta_kernel::object_store::DynObjectStore>,
+>;
+
 /// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`],
 /// then used by runners to construct snapshots.
 enum SnapshotStrategy {
@@ -113,10 +121,11 @@ impl SnapshotStrategy {
 fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
+    store_wrapper: StoreWrapper,
 ) -> Result<(Arc<dyn Engine>, SnapshotStrategy), Box<dyn std::error::Error>> {
     let Some(cm) = &table_info.catalog_info else {
         let url = table_info.resolved_table_root();
-        let engine = resolve_engine_for_url(&url, runtime)?;
+        let engine = resolve_engine_for_url(&url, runtime, store_wrapper)?;
         return Ok((engine, SnapshotStrategy::Standard { url }));
     };
 
@@ -179,7 +188,15 @@ fn resolve_snapshot_strategy(
 fn resolve_engine_for_url(
     url: &Url,
     runtime: Arc<tokio::runtime::Runtime>,
+    store_wrapper: StoreWrapper,
 ) -> Result<Arc<dyn Engine>, Box<dyn std::error::Error>> {
+    let wrap = |store: Arc<delta_kernel::object_store::DynObjectStore>| {
+        if let Some(f) = store_wrapper {
+            f(store)
+        } else {
+            store
+        }
+    };
     match url.scheme() {
         "s3" | "s3a" => {
             let region =
@@ -195,9 +212,12 @@ fn resolve_engine_for_url(
                 }
             }
             let (store, _) = delta_kernel::object_store::parse_url_opts(url, opts)?;
-            Ok(build_engine(store.into(), runtime))
+            Ok(build_engine(wrap(store.into()), runtime))
         }
-        "file" => Ok(build_engine(Arc::new(LocalFileSystem::new()), runtime)),
+        "file" => Ok(build_engine(
+            wrap(Arc::new(LocalFileSystem::new())),
+            runtime,
+        )),
         scheme => Err(format!(
             "Unsupported scheme '{scheme}': only s3://, s3a://, and file:// are supported"
         )
@@ -222,8 +242,10 @@ impl ReadMetadataRunner {
         read_spec: &ReadSpec,
         config: ReadConfig,
         runtime: Arc<tokio::runtime::Runtime>,
+        store_wrapper: StoreWrapper,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let (engine, strategy) =
+            resolve_snapshot_strategy(table_info, runtime.clone(), store_wrapper)?;
         let snapshot =
             strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
 
@@ -348,7 +370,9 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
-/// Factory function that creates the appropriate read runner for a given operation and config
+/// Factory function that creates the appropriate read runner for a given operation and config.
+/// Pass a `store_wrapper` to transform the `ObjectStore` before building the engine
+/// (e.g. to inject latency). Pass `None` for standard benchmarks.
 pub fn create_read_runner(
     table_info: &TableInfo,
     case_name: &str,
@@ -356,10 +380,16 @@ pub fn create_read_runner(
     operation: ReadOperation,
     config: ReadConfig,
     runtime: Arc<tokio::runtime::Runtime>,
+    store_wrapper: StoreWrapper,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            table_info, case_name, read_spec, config, runtime,
+            table_info,
+            case_name,
+            read_spec,
+            config,
+            runtime,
+            store_wrapper,
         )?)),
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
@@ -387,7 +417,8 @@ impl SnapshotConstructionRunner {
             snapshot_spec.as_str()
         );
 
-        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let (engine, snapshot_strategy) =
+            resolve_snapshot_strategy(table_info, runtime.clone(), None)?;
 
         Ok(Self {
             engine,
@@ -495,6 +526,7 @@ mod tests {
             &test_read_spec(),
             serial_config(),
             test_runtime(),
+            None,
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -512,6 +544,7 @@ mod tests {
             &test_read_spec(),
             parallel_config(),
             test_runtime(),
+            None,
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -575,6 +608,7 @@ mod tests {
             ReadOperation::ReadMetadata,
             serial_config(),
             test_runtime(),
+            None,
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
@@ -590,6 +624,7 @@ mod tests {
             &spec,
             serial_config(),
             test_runtime(),
+            None,
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
@@ -605,6 +640,7 @@ mod tests {
             &spec,
             serial_config(),
             test_runtime(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -618,6 +654,7 @@ mod tests {
             ReadOperation::ReadData,
             serial_config(),
             test_runtime(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -625,7 +662,7 @@ mod tests {
     #[test]
     fn test_resolve_engine_unsupported_scheme() {
         let url = Url::parse("gs://bucket/table").unwrap();
-        let result = resolve_engine_for_url(&url, test_runtime());
+        let result = resolve_engine_for_url(&url, test_runtime(), None);
         assert!(result.is_err());
     }
 
